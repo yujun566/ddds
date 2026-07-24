@@ -1,575 +1,1305 @@
-# -*- coding: utf-8 -*-
+"""HTTP server classes.
+
+Note: BaseHTTPRequestHandler doesn't implement any HTTP request; see
+SimpleHTTPRequestHandler for simple implementations of GET, HEAD and POST,
+and CGIHTTPRequestHandler for CGI scripts.
+
+It does, however, optionally implement HTTP/1.1 persistent connections,
+as of version 0.3.
+
+Notes on CGIHTTPRequestHandler
+------------------------------
+
+This class implements GET and POST requests to cgi-bin scripts.
+
+If the os.fork() function is not present (e.g. on Windows),
+subprocess.Popen() is used as a fallback, with slightly altered semantics.
+
+In all cases, the implementation is intentionally naive -- all
+requests are executed synchronously.
+
+SECURITY WARNING: DON'T USE THIS CODE UNLESS YOU ARE INSIDE A FIREWALL
+-- it may execute arbitrary Python code or external programs.
+
+Note that status code 200 is sent prior to execution of a CGI script, so
+scripts cannot send other status codes such as 302 (redirect).
+
+XXX To do:
+
+- log requests even later (to capture byte count)
+- log user-agent header and other interesting goodies
+- send error log to separate file
 """
-🌐 차원 균열의 만물상 — 온라인 서버
-표준 라이브러리만 사용 (설치 불필요)
 
-실행: python server.py
-기본 포트: 8777
 
-기능: 채팅 / 랭킹 / 길드 / 접속자 / 월드보스 / 거래소 / 우편
+# See also:
+#
+# HTTP Working Group                                        T. Berners-Lee
+# INTERNET-DRAFT                                            R. T. Fielding
+# <draft-ietf-http-v10-spec-00.txt>                     H. Frystyk Nielsen
+# Expires September 8, 1995                                  March 8, 1995
+#
+# URL: http://www.ics.uci.edu/pub/ietf/http/draft-ietf-http-v10-spec-00.txt
+#
+# and
+#
+# Network Working Group                                      R. Fielding
+# Request for Comments: 2616                                       et al
+# Obsoletes: 2068                                              June 1999
+# Category: Standards Track
+#
+# URL: http://www.faqs.org/rfcs/rfc2616.html
+
+# Log files
+# ---------
+#
+# Here's a quote from the NCSA httpd docs about log file format.
+#
+# | The logfile format is as follows. Each line consists of:
+# |
+# | host rfc931 authuser [DD/Mon/YYYY:hh:mm:ss] "request" ddd bbbb
+# |
+# |        host: Either the DNS name or the IP number of the remote client
+# |        rfc931: Any information returned by identd for this person,
+# |                - otherwise.
+# |        authuser: If user sent a userid for authentication, the user name,
+# |                  - otherwise.
+# |        DD: Day
+# |        Mon: Month (calendar name)
+# |        YYYY: Year
+# |        hh: hour (24-hour format, the machine's timezone)
+# |        mm: minutes
+# |        ss: seconds
+# |        request: The first line of the HTTP request as sent by the client.
+# |        ddd: the status code returned by the server, - if not available.
+# |        bbbb: the total number of bytes sent,
+# |              *not including the HTTP/1.0 header*, - if not available
+# |
+# | You can determine the name of the file accessed through request.
+#
+# (Actually, the latter is only true if you know the server configuration
+# at the time the request was made!)
+
+__version__ = "0.6"
+
+__all__ = [
+    "HTTPServer", "ThreadingHTTPServer", "BaseHTTPRequestHandler",
+    "SimpleHTTPRequestHandler", "CGIHTTPRequestHandler",
+]
+
+import copy
+import datetime
+import email.utils
+import html
+import http.client
+import io
+import mimetypes
+import os
+import posixpath
+import select
+import shutil
+import socket # For gethostbyaddr()
+import socketserver
+import sys
+import time
+import urllib.parse
+
+from http import HTTPStatus
+
+
+# Default error message template
+DEFAULT_ERROR_MESSAGE = """\
+<!DOCTYPE HTML>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <title>Error response</title>
+    </head>
+    <body>
+        <h1>Error response</h1>
+        <p>Error code: %(code)d</p>
+        <p>Message: %(message)s.</p>
+        <p>Error code explanation: %(code)s - %(explain)s.</p>
+    </body>
+</html>
 """
-import json, os, sys, time, threading, sqlite3, hashlib
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
-from socketserver import ThreadingMixIn
 
-# 한국어 Windows(cp949) 콘솔에서 이모지 출력 시 크래시 방지
-try:
-    if hasattr(sys.stdout, 'reconfigure'):
-        sys.stdout.reconfigure(encoding='utf-8', errors='ignore')
-    if hasattr(sys.stderr, 'reconfigure'):
-        sys.stderr.reconfigure(encoding='utf-8', errors='ignore')
-except Exception:
-    pass
+DEFAULT_ERROR_CONTENT_TYPE = "text/html;charset=utf-8"
 
+class HTTPServer(socketserver.TCPServer):
 
-def _p(*args):
-    try:
-        print(*args)
-    except Exception:
-        try:
-            enc = getattr(sys.stdout, 'encoding', None) or 'utf-8'
-            sys.stdout.write(' '.join(str(a) for a in args).encode(enc, 'ignore').decode(enc, 'ignore') + '\n')
-        except Exception:
-            pass
+    allow_reuse_address = 1    # Seems to make sense in testing environment
 
+    def server_bind(self):
+        """Override server_bind to store the server name."""
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = socket.getfqdn(host)
+        self.server_port = port
 
-PORT = int(os.environ.get('RIFT_PORT', 8777))
-HOST = os.environ.get('RIFT_HOST', '0.0.0.0')
-DB_PATH = os.environ.get('RIFT_DB') or os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), 'rift_server.db')
-_lock = threading.Lock()
 
-# ---- 요청 속도 제한 (도배/스팸 방지) ----
-RATE_LIMIT = int(os.environ.get('RIFT_RATE', 30))   # IP당 10초에 허용 요청 수
-_rate = {}
-_rate_lock = threading.Lock()
-
-def rate_ok(ip):
-    if RATE_LIMIT <= 0:
-        return True
-    now_t = time.time()
-    with _rate_lock:
-        q = _rate.setdefault(ip, [])
-        while q and now_t - q[0] > 10:
-            q.pop(0)
-        if len(q) >= RATE_LIMIT:
-            return False
-        q.append(now_t)
-        if len(_rate) > 5000:
-            for k in [k for k, v in _rate.items() if not v or now_t - v[-1] > 60]:
-                _rate.pop(k, None)
-        return True
-
-
-def db():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    with db() as c:
-        c.executescript('''
-        CREATE TABLE IF NOT EXISTS chat(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            room TEXT NOT NULL DEFAULT 'global',
-            nick TEXT NOT NULL, msg TEXT NOT NULL, ts INTEGER NOT NULL);
-        CREATE INDEX IF NOT EXISTS idx_chat ON chat(room, id);
-
-        CREATE TABLE IF NOT EXISTS ranking(
-            nick TEXT PRIMARY KEY, power REAL DEFAULT 0, stage INTEGER DEFAULT 1,
-            level INTEGER DEFAULT 1, tier TEXT DEFAULT '', ts INTEGER NOT NULL);
-
-        CREATE TABLE IF NOT EXISTS players(
-            nick TEXT PRIMARY KEY, last_seen INTEGER NOT NULL,
-            stage INTEGER DEFAULT 1, level INTEGER DEFAULT 1, guild TEXT DEFAULT '');
-
-        CREATE TABLE IF NOT EXISTS guilds(
-            name TEXT PRIMARY KEY, owner TEXT NOT NULL, notice TEXT DEFAULT '',
-            score REAL DEFAULT 0, ts INTEGER NOT NULL);
-
-        CREATE TABLE IF NOT EXISTS guild_members(
-            guild TEXT NOT NULL, nick TEXT NOT NULL, ts INTEGER NOT NULL,
-            PRIMARY KEY(guild, nick));
-
-        CREATE TABLE IF NOT EXISTS worldboss(
-            id INTEGER PRIMARY KEY CHECK(id=1), name TEXT, hp REAL, max_hp REAL,
-            season INTEGER DEFAULT 1, ts INTEGER);
-
-        CREATE TABLE IF NOT EXISTS boss_damage(
-            season INTEGER NOT NULL, nick TEXT NOT NULL, dmg REAL DEFAULT 0,
-            PRIMARY KEY(season, nick));
-
-        CREATE TABLE IF NOT EXISTS market(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, seller TEXT NOT NULL,
-            item TEXT NOT NULL, grade TEXT, price INTEGER NOT NULL,
-            sold INTEGER DEFAULT 0, buyer TEXT DEFAULT '', ts INTEGER NOT NULL);
-
-        -- 경매 시스템
-        CREATE TABLE IF NOT EXISTS auction(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            seller TEXT NOT NULL,
-            item TEXT NOT NULL,
-            grade TEXT DEFAULT '',
-            item_json TEXT DEFAULT '',      -- 장비 원본(구매자에게 그대로 전달)
-            start_price INTEGER NOT NULL,   -- 시작가
-            buyout INTEGER DEFAULT 0,       -- 즉시구매가 (0이면 없음)
-            cur_bid INTEGER DEFAULT 0,      -- 현재 최고 입찰가
-            cur_bidder TEXT DEFAULT '',     -- 현재 최고 입찰자
-            is_private INTEGER DEFAULT 0,   -- 1이면 비공개(코드 필요)
-            code TEXT DEFAULT '',           -- 비공개 입장 코드
-            end_ts INTEGER NOT NULL,        -- 종료 시각
-            closed INTEGER DEFAULT 0,       -- 1이면 정산 완료
-            ts INTEGER NOT NULL);
-        CREATE INDEX IF NOT EXISTS idx_auc ON auction(closed, end_ts);
-
-        CREATE TABLE IF NOT EXISTS auction_bids(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            auc_id INTEGER NOT NULL, nick TEXT NOT NULL,
-            amount INTEGER NOT NULL, ts INTEGER NOT NULL);
-
-        CREATE TABLE IF NOT EXISTS mail(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, receiver TEXT NOT NULL,
-            sender TEXT NOT NULL, subject TEXT, body TEXT,
-            gold INTEGER DEFAULT 0, item_json TEXT DEFAULT '',
-            taken INTEGER DEFAULT 0, ts INTEGER NOT NULL);
-        CREATE INDEX IF NOT EXISTS idx_mail ON mail(receiver, taken);
-        ''')
-        # 기존 DB 호환: 없는 컬럼 자동 추가
-        for tbl, col, decl in [('mail', 'item_json', "TEXT DEFAULT ''")]:
-            cols = [r[1] for r in c.execute('PRAGMA table_info(%s)' % tbl).fetchall()]
-            if col not in cols:
-                c.execute('ALTER TABLE %s ADD COLUMN %s %s' % (tbl, col, decl))
-
-        row = c.execute('SELECT 1 FROM worldboss WHERE id=1').fetchone()
-        if not row:
-            c.execute('INSERT INTO worldboss(id,name,hp,max_hp,season,ts) VALUES(1,?,?,?,1,?)',
-                      ('차원의 포식자', 1e12, 1e12, int(time.time())))
-
-
-def now(): return int(time.time())
-
-
-
-def close_auction(c, aid):
-    """경매 1건 낙찰 처리: 판매자에겐 골드, 낙찰자에겐 아이템을 우편 발송"""
-    row = c.execute('SELECT * FROM auction WHERE id=? AND closed=0', (aid,)).fetchone()
-    if not row:
-        return False
-    c.execute('UPDATE auction SET closed=1 WHERE id=?', (aid,))
-    if row['cur_bidder'] and row['cur_bid'] > 0:
-        # 낙찰자 → 아이템
-        c.execute('INSERT INTO mail(receiver,sender,subject,body,gold,item_json,ts) '
-                  'VALUES(?,?,?,?,0,?,?)',
-                  (row['cur_bidder'], '경매장', '낙찰 상품',
-                   '%s 낙찰 (%d G)' % (row['item'], row['cur_bid']),
-                   row['item_json'] or '', now()))
-        # 판매자 → 골드 (수수료 5%)
-        fee = int(row['cur_bid'] * 0.05)
-        c.execute('INSERT INTO mail(receiver,sender,subject,body,gold,ts) '
-                  'VALUES(?,?,?,?,?,?)',
-                  (row['seller'], '경매장', '판매 대금',
-                   '%s 낙찰 (수수료 5%%: %d G)' % (row['item'], fee),
-                   row['cur_bid'] - fee, now()))
-    else:
-        # 유찰 → 판매자에게 반환
-        c.execute('INSERT INTO mail(receiver,sender,subject,body,gold,item_json,ts) '
-                  'VALUES(?,?,?,?,0,?,?)',
-                  (row['seller'], '경매장', '유찰 반환',
-                   '%s 입찰자가 없어 반환됩니다.' % row['item'],
-                   row['item_json'] or '', now()))
-    return True
-
-
-def settle_auctions(c):
-    """종료 시각이 지난 경매를 일괄 정산"""
-    rows = c.execute('SELECT id FROM auction WHERE closed=0 AND end_ts<=?',
-                     (now(),)).fetchall()
-    for r in rows:
-        close_auction(c, r['id'])
-    return len(rows)
-
-
-# ============================== API ==============================
-def api(path, q, body):
-    # GET 쿼리와 POST 본문을 통합 (한글 파라미터는 POST 본문 권장)
-    def P(key, default=''):
-        if key in body and body[key] is not None:
-            return body[key]
-        v = q.get(key)
-        return v[0] if v else default
-
-    with _lock, db() as c:
-        # ---------- 1. 채팅 ----------
-        if path == '/chat/send':
-            nick = (body.get('nick') or '익명')[:20]
-            msg = (body.get('msg') or '')[:200]
-            room = (body.get('room') or 'global')[:40]
-            if not msg.strip():
-                return {'ok': False, 'error': 'empty'}
-            c.execute('INSERT INTO chat(room,nick,msg,ts) VALUES(?,?,?,?)',
-                      (room, nick, msg, now()))
-            c.execute('DELETE FROM chat WHERE room=? AND id NOT IN '
-                      '(SELECT id FROM chat WHERE room=? ORDER BY id DESC LIMIT 200)', (room, room))
-            return {'ok': True}
-
-        if path == '/chat/list':
-            room = str(P('room', 'global'))[:40]
-            since = int(P('since', 0) or 0)
-            rows = c.execute('SELECT id,nick,msg,ts FROM chat WHERE room=? AND id>? '
-                             'ORDER BY id DESC LIMIT 60', (room, since)).fetchall()
-            return {'ok': True, 'messages': [dict(r) for r in reversed(rows)]}
-
-        # ---------- 2. 랭킹 ----------
-        if path == '/rank/submit':
-            nick = (body.get('nick') or '익명')[:20]
-            c.execute('INSERT INTO ranking(nick,power,stage,level,tier,ts) VALUES(?,?,?,?,?,?) '
-                      'ON CONFLICT(nick) DO UPDATE SET power=excluded.power, stage=excluded.stage,'
-                      'level=excluded.level, tier=excluded.tier, ts=excluded.ts',
-                      (nick, float(body.get('power') or 0), int(body.get('stage') or 1),
-                       int(body.get('level') or 1), (body.get('tier') or '')[:20], now()))
-            c.execute('INSERT INTO players(nick,last_seen,stage,level,guild) VALUES(?,?,?,?,?) '
-                      'ON CONFLICT(nick) DO UPDATE SET last_seen=excluded.last_seen,'
-                      'stage=excluded.stage, level=excluded.level, guild=excluded.guild',
-                      (nick, now(), int(body.get('stage') or 1), int(body.get('level') or 1),
-                       (body.get('guild') or '')[:30]))
-            return {'ok': True}
-
-        if path == '/rank/list':
-            rows = c.execute('SELECT nick,power,stage,level,tier FROM ranking '
-                             'ORDER BY power DESC LIMIT 100').fetchall()
-            return {'ok': True, 'rankings': [dict(r) for r in rows]}
-
-        # ---------- 3. 접속자 ----------
-        if path == '/online':
-            cut = now() - 90
-            rows = c.execute('SELECT nick,stage,level,guild FROM players WHERE last_seen>? '
-                             'ORDER BY stage DESC LIMIT 50', (cut,)).fetchall()
-            cnt = c.execute('SELECT COUNT(*) n FROM players WHERE last_seen>?', (cut,)).fetchone()['n']
-            return {'ok': True, 'count': cnt, 'players': [dict(r) for r in rows]}
-
-        # ---------- 4. 길드 ----------
-        if path == '/guild/create':
-            name = (body.get('name') or '').strip()[:30]
-            owner = (body.get('nick') or '')[:20]
-            if not name: return {'ok': False, 'error': 'no_name'}
-            if c.execute('SELECT 1 FROM guilds WHERE name=?', (name,)).fetchone():
-                return {'ok': False, 'error': 'exists'}
-            c.execute('INSERT INTO guilds(name,owner,ts) VALUES(?,?,?)', (name, owner, now()))
-            c.execute('INSERT OR REPLACE INTO guild_members(guild,nick,ts) VALUES(?,?,?)',
-                      (name, owner, now()))
-            return {'ok': True}
-
-        if path == '/guild/join':
-            name = (body.get('name') or '')[:30]
-            nick = (body.get('nick') or '')[:20]
-            if not c.execute('SELECT 1 FROM guilds WHERE name=?', (name,)).fetchone():
-                return {'ok': False, 'error': 'not_found'}
-            c.execute('DELETE FROM guild_members WHERE nick=?', (nick,))
-            c.execute('INSERT OR REPLACE INTO guild_members(guild,nick,ts) VALUES(?,?,?)',
-                      (name, nick, now()))
-            return {'ok': True}
-
-        if path == '/guild/list':
-            rows = c.execute(
-                'SELECT g.name,g.owner,g.notice,'
-                '(SELECT COUNT(*) FROM guild_members m WHERE m.guild=g.name) members,'
-                '(SELECT IFNULL(SUM(r.power),0) FROM guild_members m JOIN ranking r ON r.nick=m.nick '
-                ' WHERE m.guild=g.name) score '
-                'FROM guilds g ORDER BY score DESC LIMIT 50').fetchall()
-            return {'ok': True, 'guilds': [dict(r) for r in rows]}
-
-        # ---------- 5. 월드보스 ----------
-        if path == '/boss/state':
-            b = dict(c.execute('SELECT * FROM worldboss WHERE id=1').fetchone())
-            top = c.execute('SELECT nick,dmg FROM boss_damage WHERE season=? '
-                            'ORDER BY dmg DESC LIMIT 10', (b['season'],)).fetchall()
-            return {'ok': True, 'boss': b, 'top': [dict(r) for r in top]}
-
-        if path == '/boss/hit':
-            nick = (body.get('nick') or '익명')[:20]
-            dmg = max(0.0, float(body.get('dmg') or 0))
-            b = c.execute('SELECT * FROM worldboss WHERE id=1').fetchone()
-            hp = max(0.0, b['hp'] - dmg)
-            season = b['season']
-            c.execute('INSERT INTO boss_damage(season,nick,dmg) VALUES(?,?,?) '
-                      'ON CONFLICT(season,nick) DO UPDATE SET dmg=dmg+?',
-                      (season, nick, dmg, dmg))
-            killed = False
-            if hp <= 0:
-                killed = True
-                season += 1
-                new_hp = b['max_hp'] * 2.5
-                c.execute('UPDATE worldboss SET hp=?,max_hp=?,season=?,ts=? WHERE id=1',
-                          (new_hp, new_hp, season, now()))
-                # 처치 보상 우편
-                for r in c.execute('SELECT nick,dmg FROM boss_damage WHERE season=? '
-                                   'ORDER BY dmg DESC LIMIT 20', (b['season'],)).fetchall():
-                    c.execute('INSERT INTO mail(receiver,sender,subject,body,gold,ts) '
-                              'VALUES(?,?,?,?,?,?)',
-                              (r['nick'], '월드보스', '토벌 보상',
-                               f"{b['name']} 처치 기여 보상", int(1e7), now()))
-            else:
-                c.execute('UPDATE worldboss SET hp=?,ts=? WHERE id=1', (hp, now()))
-            return {'ok': True, 'hp': hp, 'killed': killed, 'season': season}
-
-        # ---------- 6. 거래소 ----------
-        if path == '/market/sell':
-            c.execute('INSERT INTO market(seller,item,grade,price,ts) VALUES(?,?,?,?,?)',
-                      ((body.get('nick') or '')[:20], (body.get('item') or '')[:40],
-                       (body.get('grade') or '')[:20], int(body.get('price') or 0), now()))
-            return {'ok': True}
-
-        if path == '/market/list':
-            rows = c.execute('SELECT id,seller,item,grade,price FROM market '
-                             'WHERE sold=0 ORDER BY id DESC LIMIT 50').fetchall()
-            return {'ok': True, 'items': [dict(r) for r in rows]}
-
-        if path == '/market/buy':
-            iid = int(body.get('id') or 0)
-            buyer = (body.get('nick') or '')[:20]
-            row = c.execute('SELECT * FROM market WHERE id=? AND sold=0', (iid,)).fetchone()
-            if not row: return {'ok': False, 'error': 'sold_out'}
-            c.execute('UPDATE market SET sold=1, buyer=? WHERE id=?', (buyer, iid))
-            c.execute('INSERT INTO mail(receiver,sender,subject,body,gold,ts) VALUES(?,?,?,?,?,?)',
-                      (row['seller'], '거래소', '판매 완료',
-                       f"{row['item']} 판매 대금", row['price'], now()))
-            return {'ok': True, 'item': dict(row)}
-
-        # ---------- 7. 우편 ----------
-        if path == '/mail/list':
-            nick = str(P('nick', ''))[:20]
-            rows = c.execute('SELECT id,sender,subject,body,gold,item_json FROM mail '
-                             'WHERE receiver=? AND taken=0 ORDER BY id DESC LIMIT 30',
-                             (nick,)).fetchall()
-            return {'ok': True, 'mails': [dict(r) for r in rows]}
-
-        if path == '/mail/take':
-            mid = int(body.get('id') or 0)
-            nick = (body.get('nick') or '')[:20]
-            row = c.execute('SELECT * FROM mail WHERE id=? AND receiver=? AND taken=0',
-                            (mid, nick)).fetchone()
-            if not row: return {'ok': False, 'error': 'not_found'}
-            c.execute('UPDATE mail SET taken=1 WHERE id=?', (mid,))
-            return {'ok': True, 'gold': row['gold'], 'item_json': row['item_json'] or ''}
-
-        if path == '/mail/send':
-            c.execute('INSERT INTO mail(receiver,sender,subject,body,gold,ts) VALUES(?,?,?,?,?,?)',
-                      ((body.get('to') or '')[:20], (body.get('nick') or '')[:20],
-                       (body.get('subject') or '쪽지')[:40], (body.get('body') or '')[:200],
-                       int(body.get('gold') or 0), now()))
-            return {'ok': True}
-
-
-        # ---------- 8. 경매 ----------
-        if path == '/auction/create':
-            seller = str(P('nick', ''))[:20]
-            item = str(P('item', ''))[:40]
-            if not seller or not item:
-                return {'ok': False, 'error': 'bad_request'}
-            start_price = max(1, int(P('start_price', 1) or 1))
-            buyout = max(0, int(P('buyout', 0) or 0))
-            if buyout and buyout < start_price:
-                return {'ok': False, 'error': 'buyout_too_low'}
-            is_private = 1 if P('is_private', 0) in (1, '1', True, 'true') else 0
-            code = str(P('code', ''))[:20]
-            if is_private and not code:
-                return {'ok': False, 'error': 'code_required'}
-            minutes = max(1, min(1440, int(P('minutes', 30) or 30)))
-            c.execute(
-                'INSERT INTO auction(seller,item,grade,item_json,start_price,buyout,'
-                'cur_bid,cur_bidder,is_private,code,end_ts,ts) '
-                'VALUES(?,?,?,?,?,?,0,"",?,?,?,?)',
-                (seller, item, str(P('grade', ''))[:20], str(P('item_json', ''))[:2000],
-                 start_price, buyout, is_private, code, now() + minutes * 60, now()))
-            return {'ok': True, 'id': c.execute('SELECT last_insert_rowid() i').fetchone()['i']}
-
-        if path == '/auction/list':
-            settle_auctions(c)
-            code = str(P('code', ''))[:20]
-            if code:
-                # 비공개 방: 코드가 일치하는 경매만
-                rows = c.execute(
-                    'SELECT id,seller,item,grade,start_price,buyout,cur_bid,cur_bidder,'
-                    'is_private,end_ts FROM auction '
-                    'WHERE closed=0 AND is_private=1 AND code=? ORDER BY end_ts ASC LIMIT 50',
-                    (code,)).fetchall()
-                return {'ok': True, 'items': [dict(r) for r in rows], 'private': True}
-            rows = c.execute(
-                'SELECT id,seller,item,grade,start_price,buyout,cur_bid,cur_bidder,'
-                'is_private,end_ts FROM auction '
-                'WHERE closed=0 AND is_private=0 ORDER BY end_ts ASC LIMIT 50').fetchall()
-            return {'ok': True, 'items': [dict(r) for r in rows], 'private': False,
-                    'now': now()}
-
-        if path == '/auction/bid':
-            settle_auctions(c)
-            aid = int(P('id', 0) or 0)
-            nick = str(P('nick', ''))[:20]
-            amount = int(P('amount', 0) or 0)
-            row = c.execute('SELECT * FROM auction WHERE id=? AND closed=0', (aid,)).fetchone()
-            if not row:
-                return {'ok': False, 'error': 'not_found'}
-            if row['end_ts'] <= now():
-                return {'ok': False, 'error': 'ended'}
-            if row['seller'] == nick:
-                return {'ok': False, 'error': 'own_auction'}
-            if row['is_private'] and str(P('code', '')) != row['code']:
-                return {'ok': False, 'error': 'bad_code'}
-            floor = max(row['cur_bid'], row['start_price'] - 1)
-            if amount <= floor:
-                return {'ok': False, 'error': 'low_bid', 'min': floor + 1}
-            # 이전 입찰자에게 환불 우편
-            if row['cur_bidder'] and row['cur_bid'] > 0:
-                c.execute('INSERT INTO mail(receiver,sender,subject,body,gold,ts) '
-                          'VALUES(?,?,?,?,?,?)',
-                          (row['cur_bidder'], '경매장', '입찰 환불',
-                           row['item'] + ' 경매에서 상위 입찰이 발생했습니다.',
-                           row['cur_bid'], now()))
-            c.execute('UPDATE auction SET cur_bid=?, cur_bidder=? WHERE id=?',
-                      (amount, nick, aid))
-            c.execute('INSERT INTO auction_bids(auc_id,nick,amount,ts) VALUES(?,?,?,?)',
-                      (aid, nick, amount, now()))
-            # 즉시구매가 도달 시 즉시 낙찰
-            if row['buyout'] and amount >= row['buyout']:
-                close_auction(c, aid)
-                return {'ok': True, 'won': True, 'amount': amount}
-            return {'ok': True, 'won': False, 'amount': amount}
-
-        if path == '/auction/buyout':
-            settle_auctions(c)
-            aid = int(P('id', 0) or 0)
-            nick = str(P('nick', ''))[:20]
-            row = c.execute('SELECT * FROM auction WHERE id=? AND closed=0', (aid,)).fetchone()
-            if not row:
-                return {'ok': False, 'error': 'not_found'}
-            if not row['buyout']:
-                return {'ok': False, 'error': 'no_buyout'}
-            if row['seller'] == nick:
-                return {'ok': False, 'error': 'own_auction'}
-            if row['is_private'] and str(P('code', '')) != row['code']:
-                return {'ok': False, 'error': 'bad_code'}
-            if row['cur_bidder'] and row['cur_bid'] > 0:
-                c.execute('INSERT INTO mail(receiver,sender,subject,body,gold,ts) '
-                          'VALUES(?,?,?,?,?,?)',
-                          (row['cur_bidder'], '경매장', '입찰 환불',
-                           row['item'] + ' 즉시구매로 종료되었습니다.', row['cur_bid'], now()))
-            c.execute('UPDATE auction SET cur_bid=?, cur_bidder=? WHERE id=?',
-                      (row['buyout'], nick, aid))
-            close_auction(c, aid)
-            return {'ok': True, 'amount': row['buyout']}
-
-        if path == '/auction/mine':
-            settle_auctions(c)
-            nick = str(P('nick', ''))[:20]
-            rows = c.execute(
-                'SELECT id,item,grade,start_price,buyout,cur_bid,cur_bidder,is_private,'
-                'code,end_ts,closed FROM auction WHERE seller=? ORDER BY id DESC LIMIT 30',
-                (nick,)).fetchall()
-            return {'ok': True, 'items': [dict(r) for r in rows], 'now': now()}
-
-        if path == '/auction/cancel':
-            aid = int(P('id', 0) or 0)
-            nick = str(P('nick', ''))[:20]
-            row = c.execute('SELECT * FROM auction WHERE id=? AND closed=0', (aid,)).fetchone()
-            if not row:
-                return {'ok': False, 'error': 'not_found'}
-            if row['seller'] != nick:
-                return {'ok': False, 'error': 'not_owner'}
-            if row['cur_bidder']:
-                return {'ok': False, 'error': 'has_bid'}   # 입찰이 있으면 취소 불가
-            c.execute('UPDATE auction SET closed=1 WHERE id=?', (aid,))
-            c.execute('INSERT INTO mail(receiver,sender,subject,body,gold,item_json,ts) '
-                      'VALUES(?,?,?,?,0,?,?)',
-                      (nick, '경매장', '경매 취소', row['item'] + ' 반환',
-                       row['item_json'] or '', now()))
-            return {'ok': True}
-
-        if path == '/ping':
-            return {'ok': True, 'server': 'rift', 'time': now()}
-
-    return {'ok': False, 'error': 'unknown_endpoint'}
-
-
-class Handler(BaseHTTPRequestHandler):
-    def _send(self, obj, code=200):
-        data = json.dumps(obj, ensure_ascii=False).encode('utf-8')
-        self.send_response(code)
-        self.send_header('Content-Type', 'application/json; charset=utf-8')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.send_header('Content-Length', str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.send_header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-        self.end_headers()
-
-    def do_GET(self):
-        u = urlparse(self.path)
-        if not rate_ok(self.client_address[0]):
-            return self._send({'ok': False, 'error': 'rate_limited'}, 429)
-        try:
-            self._send(api(u.path, parse_qs(u.query), {}))
-        except Exception as e:
-            self._send({'ok': False, 'error': str(e)}, 500)
-
-    def do_POST(self):
-        u = urlparse(self.path)
-        if not rate_ok(self.client_address[0]):
-            return self._send({'ok': False, 'error': 'rate_limited'}, 429)
-        try:
-            n = int(self.headers.get('Content-Length') or 0)
-            body = json.loads(self.rfile.read(n) or b'{}') if n else {}
-        except Exception:
-            body = {}
-        try:
-            self._send(api(u.path, parse_qs(u.query), body))
-        except Exception as e:
-            self._send({'ok': False, 'error': str(e)}, 500)
-
-    def log_message(self, *a):
-        pass  # 콘솔 조용히
-
-
-class ThreadedHTTP(ThreadingMixIn, HTTPServer):
-    allow_reuse_address = True
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
-def start_background():
-    """게임 런처에서 서버를 백그라운드로 띄울 때 사용"""
-    init_db()
-    srv = ThreadedHTTP((HOST, PORT), Handler)
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    return srv
+class BaseHTTPRequestHandler(socketserver.StreamRequestHandler):
 
+    """HTTP request handler base class.
+
+    The following explanation of HTTP serves to guide you through the
+    code as well as to expose any misunderstandings I may have about
+    HTTP (so you don't need to read the code to figure out I'm wrong
+    :-).
+
+    HTTP (HyperText Transfer Protocol) is an extensible protocol on
+    top of a reliable stream transport (e.g. TCP/IP).  The protocol
+    recognizes three parts to a request:
+
+    1. One line identifying the request type and path
+    2. An optional set of RFC-822-style headers
+    3. An optional data part
+
+    The headers and data are separated by a blank line.
+
+    The first line of the request has the form
+
+    <command> <path> <version>
+
+    where <command> is a (case-sensitive) keyword such as GET or POST,
+    <path> is a string containing path information for the request,
+    and <version> should be the string "HTTP/1.0" or "HTTP/1.1".
+    <path> is encoded using the URL encoding scheme (using %xx to signify
+    the ASCII character with hex code xx).
+
+    The specification specifies that lines are separated by CRLF but
+    for compatibility with the widest range of clients recommends
+    servers also handle LF.  Similarly, whitespace in the request line
+    is treated sensibly (allowing multiple spaces between components
+    and allowing trailing whitespace).
+
+    Similarly, for output, lines ought to be separated by CRLF pairs
+    but most clients grok LF characters just fine.
+
+    If the first line of the request has the form
+
+    <command> <path>
+
+    (i.e. <version> is left out) then this is assumed to be an HTTP
+    0.9 request; this form has no optional headers and data part and
+    the reply consists of just the data.
+
+    The reply form of the HTTP 1.x protocol again has three parts:
+
+    1. One line giving the response code
+    2. An optional set of RFC-822-style headers
+    3. The data
+
+    Again, the headers and data are separated by a blank line.
+
+    The response code line has the form
+
+    <version> <responsecode> <responsestring>
+
+    where <version> is the protocol version ("HTTP/1.0" or "HTTP/1.1"),
+    <responsecode> is a 3-digit response code indicating success or
+    failure of the request, and <responsestring> is an optional
+    human-readable string explaining what the response code means.
+
+    This server parses the request and the headers, and then calls a
+    function specific to the request type (<command>).  Specifically,
+    a request SPAM will be handled by a method do_SPAM().  If no
+    such method exists the server sends an error response to the
+    client.  If it exists, it is called with no arguments:
+
+    do_SPAM()
+
+    Note that the request name is case sensitive (i.e. SPAM and spam
+    are different requests).
+
+    The various request details are stored in instance variables:
+
+    - client_address is the client IP address in the form (host,
+    port);
+
+    - command, path and version are the broken-down request line;
+
+    - headers is an instance of email.message.Message (or a derived
+    class) containing the header information;
+
+    - rfile is a file object open for reading positioned at the
+    start of the optional input data part;
+
+    - wfile is a file object open for writing.
+
+    IT IS IMPORTANT TO ADHERE TO THE PROTOCOL FOR WRITING!
+
+    The first thing to be written must be the response line.  Then
+    follow 0 or more header lines, then a blank line, and then the
+    actual data (if any).  The meaning of the header lines depends on
+    the command executed by the server; in most cases, when data is
+    returned, there should be at least one header line of the form
+
+    Content-type: <type>/<subtype>
+
+    where <type> and <subtype> should be registered MIME types,
+    e.g. "text/html" or "text/plain".
+
+    """
+
+    # The Python system version, truncated to its first component.
+    sys_version = "Python/" + sys.version.split()[0]
+
+    # The server software version.  You may want to override this.
+    # The format is multiple whitespace-separated strings,
+    # where each string is of the form name[/version].
+    server_version = "BaseHTTP/" + __version__
+
+    error_message_format = DEFAULT_ERROR_MESSAGE
+    error_content_type = DEFAULT_ERROR_CONTENT_TYPE
+
+    # The default request version.  This only affects responses up until
+    # the point where the request line is parsed, so it mainly decides what
+    # the client gets back when sending a malformed request line.
+    # Most web servers default to HTTP 0.9, i.e. don't send a status line.
+    default_request_version = "HTTP/0.9"
+
+    def parse_request(self):
+        """Parse a request (internal).
+
+        The request should be stored in self.raw_requestline; the results
+        are in self.command, self.path, self.request_version and
+        self.headers.
+
+        Return True for success, False for failure; on failure, any relevant
+        error response has already been sent back.
+
+        """
+        self.command = None  # set in case of error on the first line
+        self.request_version = version = self.default_request_version
+        self.close_connection = True
+        requestline = str(self.raw_requestline, 'iso-8859-1')
+        requestline = requestline.rstrip('\r\n')
+        self.requestline = requestline
+        words = requestline.split()
+        if len(words) == 0:
+            return False
+
+        if len(words) >= 3:  # Enough to determine protocol version
+            version = words[-1]
+            try:
+                if not version.startswith('HTTP/'):
+                    raise ValueError
+                base_version_number = version.split('/', 1)[1]
+                version_number = base_version_number.split(".")
+                # RFC 2145 section 3.1 says there can be only one "." and
+                #   - major and minor numbers MUST be treated as
+                #      separate integers;
+                #   - HTTP/2.4 is a lower version than HTTP/2.13, which in
+                #      turn is lower than HTTP/12.3;
+                #   - Leading zeros MUST be ignored by recipients.
+                if len(version_number) != 2:
+                    raise ValueError
+                version_number = int(version_number[0]), int(version_number[1])
+            except (ValueError, IndexError):
+                self.send_error(
+                    HTTPStatus.BAD_REQUEST,
+                    "Bad request version (%r)" % version)
+                return False
+            if version_number >= (1, 1) and self.protocol_version >= "HTTP/1.1":
+                self.close_connection = False
+            if version_number >= (2, 0):
+                self.send_error(
+                    HTTPStatus.HTTP_VERSION_NOT_SUPPORTED,
+                    "Invalid HTTP version (%s)" % base_version_number)
+                return False
+            self.request_version = version
+
+        if not 2 <= len(words) <= 3:
+            self.send_error(
+                HTTPStatus.BAD_REQUEST,
+                "Bad request syntax (%r)" % requestline)
+            return False
+        command, path = words[:2]
+        if len(words) == 2:
+            self.close_connection = True
+            if command != 'GET':
+                self.send_error(
+                    HTTPStatus.BAD_REQUEST,
+                    "Bad HTTP/0.9 request type (%r)" % command)
+                return False
+        self.command, self.path = command, path
+
+        # gh-87389: The purpose of replacing '//' with '/' is to protect
+        # against open redirect attacks possibly triggered if the path starts
+        # with '//' because http clients treat //path as an absolute URI
+        # without scheme (similar to http://path) rather than a path.
+        if self.path.startswith('//'):
+            self.path = '/' + self.path.lstrip('/')  # Reduce to a single /
+
+        # Examine the headers and look for a Connection directive.
+        try:
+            self.headers = http.client.parse_headers(self.rfile,
+                                                     _class=self.MessageClass)
+        except http.client.LineTooLong as err:
+            self.send_error(
+                HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE,
+                "Line too long",
+                str(err))
+            return False
+        except http.client.HTTPException as err:
+            self.send_error(
+                HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE,
+                "Too many headers",
+                str(err)
+            )
+            return False
+
+        conntype = self.headers.get('Connection', "")
+        if conntype.lower() == 'close':
+            self.close_connection = True
+        elif (conntype.lower() == 'keep-alive' and
+              self.protocol_version >= "HTTP/1.1"):
+            self.close_connection = False
+        # Examine the headers and look for an Expect directive
+        expect = self.headers.get('Expect', "")
+        if (expect.lower() == "100-continue" and
+                self.protocol_version >= "HTTP/1.1" and
+                self.request_version >= "HTTP/1.1"):
+            if not self.handle_expect_100():
+                return False
+        return True
+
+    def handle_expect_100(self):
+        """Decide what to do with an "Expect: 100-continue" header.
+
+        If the client is expecting a 100 Continue response, we must
+        respond with either a 100 Continue or a final response before
+        waiting for the request body. The default is to always respond
+        with a 100 Continue. You can behave differently (for example,
+        reject unauthorized requests) by overriding this method.
+
+        This method should either return True (possibly after sending
+        a 100 Continue response) or send an error response and return
+        False.
+
+        """
+        self.send_response_only(HTTPStatus.CONTINUE)
+        self.end_headers()
+        return True
+
+    def handle_one_request(self):
+        """Handle a single HTTP request.
+
+        You normally don't need to override this method; see the class
+        __doc__ string for information on how to handle specific HTTP
+        commands such as GET and POST.
+
+        """
+        try:
+            self.raw_requestline = self.rfile.readline(65537)
+            if len(self.raw_requestline) > 65536:
+                self.requestline = ''
+                self.request_version = ''
+                self.command = ''
+                self.send_error(HTTPStatus.REQUEST_URI_TOO_LONG)
+                return
+            if not self.raw_requestline:
+                self.close_connection = True
+                return
+            if not self.parse_request():
+                # An error code has been sent, just exit
+                return
+            mname = 'do_' + self.command
+            if not hasattr(self, mname):
+                self.send_error(
+                    HTTPStatus.NOT_IMPLEMENTED,
+                    "Unsupported method (%r)" % self.command)
+                return
+            method = getattr(self, mname)
+            method()
+            self.wfile.flush() #actually send the response if not already done.
+        except TimeoutError as e:
+            #a read or a write timed out.  Discard this connection
+            self.log_error("Request timed out: %r", e)
+            self.close_connection = True
+            return
+
+    def handle(self):
+        """Handle multiple requests if necessary."""
+        self.close_connection = True
+
+        self.handle_one_request()
+        while not self.close_connection:
+            self.handle_one_request()
+
+    def send_error(self, code, message=None, explain=None):
+        """Send and log an error reply.
+
+        Arguments are
+        * code:    an HTTP error code
+                   3 digits
+        * message: a simple optional 1 line reason phrase.
+                   *( HTAB / SP / VCHAR / %x80-FF )
+                   defaults to short entry matching the response code
+        * explain: a detailed message defaults to the long entry
+                   matching the response code.
+
+        This sends an error response (so it must be called before any
+        output has been generated), logs the error, and finally sends
+        a piece of HTML explaining the error to the user.
+
+        """
+
+        try:
+            shortmsg, longmsg = self.responses[code]
+        except KeyError:
+            shortmsg, longmsg = '???', '???'
+        if message is None:
+            message = shortmsg
+        if explain is None:
+            explain = longmsg
+        self.log_error("code %d, message %s", code, message)
+        self.send_response(code, message)
+        self.send_header('Connection', 'close')
+
+        # Message body is omitted for cases described in:
+        #  - RFC7230: 3.3. 1xx, 204(No Content), 304(Not Modified)
+        #  - RFC7231: 6.3.6. 205(Reset Content)
+        body = None
+        if (code >= 200 and
+            code not in (HTTPStatus.NO_CONTENT,
+                         HTTPStatus.RESET_CONTENT,
+                         HTTPStatus.NOT_MODIFIED)):
+            # HTML encode to prevent Cross Site Scripting attacks
+            # (see bug #1100201)
+            content = (self.error_message_format % {
+                'code': code,
+                'message': html.escape(message, quote=False),
+                'explain': html.escape(explain, quote=False)
+            })
+            body = content.encode('UTF-8', 'replace')
+            self.send_header("Content-Type", self.error_content_type)
+            self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+
+        if self.command != 'HEAD' and body:
+            self.wfile.write(body)
+
+    def send_response(self, code, message=None):
+        """Add the response header to the headers buffer and log the
+        response code.
+
+        Also send two standard headers with the server software
+        version and the current date.
+
+        """
+        self.log_request(code)
+        self.send_response_only(code, message)
+        self.send_header('Server', self.version_string())
+        self.send_header('Date', self.date_time_string())
+
+    def send_response_only(self, code, message=None):
+        """Send the response header only."""
+        if self.request_version != 'HTTP/0.9':
+            if message is None:
+                if code in self.responses:
+                    message = self.responses[code][0]
+                else:
+                    message = ''
+            if not hasattr(self, '_headers_buffer'):
+                self._headers_buffer = []
+            self._headers_buffer.append(("%s %d %s\r\n" %
+                    (self.protocol_version, code, message)).encode(
+                        'latin-1', 'strict'))
+
+    def send_header(self, keyword, value):
+        """Send a MIME header to the headers buffer."""
+        if self.request_version != 'HTTP/0.9':
+            if not hasattr(self, '_headers_buffer'):
+                self._headers_buffer = []
+            self._headers_buffer.append(
+                ("%s: %s\r\n" % (keyword, value)).encode('latin-1', 'strict'))
+
+        if keyword.lower() == 'connection':
+            if value.lower() == 'close':
+                self.close_connection = True
+            elif value.lower() == 'keep-alive':
+                self.close_connection = False
+
+    def end_headers(self):
+        """Send the blank line ending the MIME headers."""
+        if self.request_version != 'HTTP/0.9':
+            self._headers_buffer.append(b"\r\n")
+            self.flush_headers()
+
+    def flush_headers(self):
+        if hasattr(self, '_headers_buffer'):
+            self.wfile.write(b"".join(self._headers_buffer))
+            self._headers_buffer = []
+
+    def log_request(self, code='-', size='-'):
+        """Log an accepted request.
+
+        This is called by send_response().
+
+        """
+        if isinstance(code, HTTPStatus):
+            code = code.value
+        self.log_message('"%s" %s %s',
+                         self.requestline, str(code), str(size))
+
+    def log_error(self, format, *args):
+        """Log an error.
+
+        This is called when a request cannot be fulfilled.  By
+        default it passes the message on to log_message().
+
+        Arguments are the same as for log_message().
+
+        XXX This should go to the separate error log.
+
+        """
+
+        self.log_message(format, *args)
+
+    def log_message(self, format, *args):
+        """Log an arbitrary message.
+
+        This is used by all other logging functions.  Override
+        it if you have specific logging wishes.
+
+        The first argument, FORMAT, is a format string for the
+        message to be logged.  If the format string contains
+        any % escapes requiring parameters, they should be
+        specified as subsequent arguments (it's just like
+        printf!).
+
+        The client ip and current date/time are prefixed to
+        every message.
+
+        """
+
+        sys.stderr.write("%s - - [%s] %s\n" %
+                         (self.address_string(),
+                          self.log_date_time_string(),
+                          format%args))
+
+    def version_string(self):
+        """Return the server software version string."""
+        return self.server_version + ' ' + self.sys_version
+
+    def date_time_string(self, timestamp=None):
+        """Return the current date and time formatted for a message header."""
+        if timestamp is None:
+            timestamp = time.time()
+        return email.utils.formatdate(timestamp, usegmt=True)
+
+    def log_date_time_string(self):
+        """Return the current time formatted for logging."""
+        now = time.time()
+        year, month, day, hh, mm, ss, x, y, z = time.localtime(now)
+        s = "%02d/%3s/%04d %02d:%02d:%02d" % (
+                day, self.monthname[month], year, hh, mm, ss)
+        return s
+
+    weekdayname = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+    monthname = [None,
+                 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+    def address_string(self):
+        """Return the client address."""
+
+        return self.client_address[0]
+
+    # Essentially static class variables
+
+    # The version of the HTTP protocol we support.
+    # Set this to HTTP/1.1 to enable automatic keepalive
+    protocol_version = "HTTP/1.0"
+
+    # MessageClass used to parse headers
+    MessageClass = http.client.HTTPMessage
+
+    # hack to maintain backwards compatibility
+    responses = {
+        v: (v.phrase, v.description)
+        for v in HTTPStatus.__members__.values()
+    }
+
+
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+
+    """Simple HTTP request handler with GET and HEAD commands.
+
+    This serves files from the current directory and any of its
+    subdirectories.  The MIME type for files is determined by
+    calling the .guess_type() method.
+
+    The GET and HEAD requests are identical except that the HEAD
+    request omits the actual contents of the file.
+
+    """
+
+    server_version = "SimpleHTTP/" + __version__
+    extensions_map = _encodings_map_default = {
+        '.gz': 'application/gzip',
+        '.Z': 'application/octet-stream',
+        '.bz2': 'application/x-bzip2',
+        '.xz': 'application/x-xz',
+    }
+
+    def __init__(self, *args, directory=None, **kwargs):
+        if directory is None:
+            directory = os.getcwd()
+        self.directory = os.fspath(directory)
+        super().__init__(*args, **kwargs)
+
+    def do_GET(self):
+        """Serve a GET request."""
+        f = self.send_head()
+        if f:
+            try:
+                self.copyfile(f, self.wfile)
+            finally:
+                f.close()
+
+    def do_HEAD(self):
+        """Serve a HEAD request."""
+        f = self.send_head()
+        if f:
+            f.close()
+
+    def send_head(self):
+        """Common code for GET and HEAD commands.
+
+        This sends the response code and MIME headers.
+
+        Return value is either a file object (which has to be copied
+        to the outputfile by the caller unless the command was HEAD,
+        and must be closed by the caller under all circumstances), or
+        None, in which case the caller has nothing further to do.
+
+        """
+        path = self.translate_path(self.path)
+        f = None
+        if os.path.isdir(path):
+            parts = urllib.parse.urlsplit(self.path)
+            if not parts.path.endswith('/'):
+                # redirect browser - doing basically what apache does
+                self.send_response(HTTPStatus.MOVED_PERMANENTLY)
+                new_parts = (parts[0], parts[1], parts[2] + '/',
+                             parts[3], parts[4])
+                new_url = urllib.parse.urlunsplit(new_parts)
+                self.send_header("Location", new_url)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return None
+            for index in "index.html", "index.htm":
+                index = os.path.join(path, index)
+                if os.path.exists(index):
+                    path = index
+                    break
+            else:
+                return self.list_directory(path)
+        ctype = self.guess_type(path)
+        # check for trailing "/" which should return 404. See Issue17324
+        # The test for this was added in test_httpserver.py
+        # However, some OS platforms accept a trailingSlash as a filename
+        # See discussion on python-dev and Issue34711 regarding
+        # parsing and rejection of filenames with a trailing slash
+        if path.endswith("/"):
+            self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+            return None
+        try:
+            f = open(path, 'rb')
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+            return None
+
+        try:
+            fs = os.fstat(f.fileno())
+            # Use browser cache if possible
+            if ("If-Modified-Since" in self.headers
+                    and "If-None-Match" not in self.headers):
+                # compare If-Modified-Since and time of last file modification
+                try:
+                    ims = email.utils.parsedate_to_datetime(
+                        self.headers["If-Modified-Since"])
+                except (TypeError, IndexError, OverflowError, ValueError):
+                    # ignore ill-formed values
+                    pass
+                else:
+                    if ims.tzinfo is None:
+                        # obsolete format with no timezone, cf.
+                        # https://tools.ietf.org/html/rfc7231#section-7.1.1.1
+                        ims = ims.replace(tzinfo=datetime.timezone.utc)
+                    if ims.tzinfo is datetime.timezone.utc:
+                        # compare to UTC datetime of last modification
+                        last_modif = datetime.datetime.fromtimestamp(
+                            fs.st_mtime, datetime.timezone.utc)
+                        # remove microseconds, like in If-Modified-Since
+                        last_modif = last_modif.replace(microsecond=0)
+
+                        if last_modif <= ims:
+                            self.send_response(HTTPStatus.NOT_MODIFIED)
+                            self.end_headers()
+                            f.close()
+                            return None
+
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-type", ctype)
+            self.send_header("Content-Length", str(fs[6]))
+            self.send_header("Last-Modified",
+                self.date_time_string(fs.st_mtime))
+            self.end_headers()
+            return f
+        except:
+            f.close()
+            raise
+
+    def list_directory(self, path):
+        """Helper to produce a directory listing (absent index.html).
+
+        Return value is either a file object, or None (indicating an
+        error).  In either case, the headers are sent, making the
+        interface the same as for send_head().
+
+        """
+        try:
+            list = os.listdir(path)
+        except OSError:
+            self.send_error(
+                HTTPStatus.NOT_FOUND,
+                "No permission to list directory")
+            return None
+        list.sort(key=lambda a: a.lower())
+        r = []
+        try:
+            displaypath = urllib.parse.unquote(self.path,
+                                               errors='surrogatepass')
+        except UnicodeDecodeError:
+            displaypath = urllib.parse.unquote(path)
+        displaypath = html.escape(displaypath, quote=False)
+        enc = sys.getfilesystemencoding()
+        title = f'Directory listing for {displaypath}'
+        r.append('<!DOCTYPE HTML>')
+        r.append('<html lang="en">')
+        r.append('<head>')
+        r.append(f'<meta charset="{enc}">')
+        r.append(f'<title>{title}</title>\n</head>')
+        r.append(f'<body>\n<h1>{title}</h1>')
+        r.append('<hr>\n<ul>')
+        for name in list:
+            fullname = os.path.join(path, name)
+            displayname = linkname = name
+            # Append / for directories or @ for symbolic links
+            if os.path.isdir(fullname):
+                displayname = name + "/"
+                linkname = name + "/"
+            if os.path.islink(fullname):
+                displayname = name + "@"
+                # Note: a link to a directory displays with @ and links with /
+            r.append('<li><a href="%s">%s</a></li>'
+                    % (urllib.parse.quote(linkname,
+                                          errors='surrogatepass'),
+                       html.escape(displayname, quote=False)))
+        r.append('</ul>\n<hr>\n</body>\n</html>\n')
+        encoded = '\n'.join(r).encode(enc, 'surrogateescape')
+        f = io.BytesIO()
+        f.write(encoded)
+        f.seek(0)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-type", "text/html; charset=%s" % enc)
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        return f
+
+    def translate_path(self, path):
+        """Translate a /-separated PATH to the local filename syntax.
+
+        Components that mean special things to the local file system
+        (e.g. drive or directory names) are ignored.  (XXX They should
+        probably be diagnosed.)
+
+        """
+        # abandon query parameters
+        path = path.split('?',1)[0]
+        path = path.split('#',1)[0]
+        # Don't forget explicit trailing slash when normalizing. Issue17324
+        trailing_slash = path.rstrip().endswith('/')
+        try:
+            path = urllib.parse.unquote(path, errors='surrogatepass')
+        except UnicodeDecodeError:
+            path = urllib.parse.unquote(path)
+        path = posixpath.normpath(path)
+        words = path.split('/')
+        words = filter(None, words)
+        path = self.directory
+        for word in words:
+            if os.path.dirname(word) or word in (os.curdir, os.pardir):
+                # Ignore components that are not a simple file/directory name
+                continue
+            path = os.path.join(path, word)
+        if trailing_slash:
+            path += '/'
+        return path
+
+    def copyfile(self, source, outputfile):
+        """Copy all data between two file objects.
+
+        The SOURCE argument is a file object open for reading
+        (or anything with a read() method) and the DESTINATION
+        argument is a file object open for writing (or
+        anything with a write() method).
+
+        The only reason for overriding this would be to change
+        the block size or perhaps to replace newlines by CRLF
+        -- note however that this the default server uses this
+        to copy binary data as well.
+
+        """
+        shutil.copyfileobj(source, outputfile)
+
+    def guess_type(self, path):
+        """Guess the type of a file.
+
+        Argument is a PATH (a filename).
+
+        Return value is a string of the form type/subtype,
+        usable for a MIME Content-type header.
+
+        The default implementation looks the file's extension
+        up in the table self.extensions_map, using application/octet-stream
+        as a default; however it would be permissible (if
+        slow) to look inside the data to make a better guess.
+
+        """
+        base, ext = posixpath.splitext(path)
+        if ext in self.extensions_map:
+            return self.extensions_map[ext]
+        ext = ext.lower()
+        if ext in self.extensions_map:
+            return self.extensions_map[ext]
+        guess, _ = mimetypes.guess_type(path)
+        if guess:
+            return guess
+        return 'application/octet-stream'
+
+
+# Utilities for CGIHTTPRequestHandler
+
+def _url_collapse_path(path):
+    """
+    Given a URL path, remove extra '/'s and '.' path elements and collapse
+    any '..' references and returns a collapsed path.
+
+    Implements something akin to RFC-2396 5.2 step 6 to parse relative paths.
+    The utility of this function is limited to is_cgi method and helps
+    preventing some security attacks.
+
+    Returns: The reconstituted URL, which will always start with a '/'.
+
+    Raises: IndexError if too many '..' occur within the path.
+
+    """
+    # Query component should not be involved.
+    path, _, query = path.partition('?')
+    path = urllib.parse.unquote(path)
+
+    # Similar to os.path.split(os.path.normpath(path)) but specific to URL
+    # path semantics rather than local operating system semantics.
+    path_parts = path.split('/')
+    head_parts = []
+    for part in path_parts[:-1]:
+        if part == '..':
+            head_parts.pop() # IndexError if more '..' than prior parts
+        elif part and part != '.':
+            head_parts.append( part )
+    if path_parts:
+        tail_part = path_parts.pop()
+        if tail_part:
+            if tail_part == '..':
+                head_parts.pop()
+                tail_part = ''
+            elif tail_part == '.':
+                tail_part = ''
+    else:
+        tail_part = ''
+
+    if query:
+        tail_part = '?'.join((tail_part, query))
+
+    splitpath = ('/' + '/'.join(head_parts), tail_part)
+    collapsed_path = "/".join(splitpath)
+
+    return collapsed_path
+
+
+
+nobody = None
+
+def nobody_uid():
+    """Internal routine to get nobody's uid"""
+    global nobody
+    if nobody:
+        return nobody
+    try:
+        import pwd
+    except ImportError:
+        return -1
+    try:
+        nobody = pwd.getpwnam('nobody')[2]
+    except KeyError:
+        nobody = 1 + max(x[2] for x in pwd.getpwall())
+    return nobody
+
+
+def executable(path):
+    """Test for executable file."""
+    return os.access(path, os.X_OK)
+
+
+class CGIHTTPRequestHandler(SimpleHTTPRequestHandler):
+
+    """Complete HTTP server with GET, HEAD and POST commands.
+
+    GET and HEAD also support running CGI scripts.
+
+    The POST command is *only* implemented for CGI scripts.
+
+    """
+
+    # Determine platform specifics
+    have_fork = hasattr(os, 'fork')
+
+    # Make rfile unbuffered -- we need to read one line and then pass
+    # the rest to a subprocess, so we can't use buffered input.
+    rbufsize = 0
+
+    def do_POST(self):
+        """Serve a POST request.
+
+        This is only implemented for CGI scripts.
+
+        """
+
+        if self.is_cgi():
+            self.run_cgi()
+        else:
+            self.send_error(
+                HTTPStatus.NOT_IMPLEMENTED,
+                "Can only POST to CGI scripts")
+
+    def send_head(self):
+        """Version of send_head that support CGI scripts"""
+        if self.is_cgi():
+            return self.run_cgi()
+        else:
+            return SimpleHTTPRequestHandler.send_head(self)
+
+    def is_cgi(self):
+        """Test whether self.path corresponds to a CGI script.
+
+        Returns True and updates the cgi_info attribute to the tuple
+        (dir, rest) if self.path requires running a CGI script.
+        Returns False otherwise.
+
+        If any exception is raised, the caller should assume that
+        self.path was rejected as invalid and act accordingly.
+
+        The default implementation tests whether the normalized url
+        path begins with one of the strings in self.cgi_directories
+        (and the next character is a '/' or the end of the string).
+
+        """
+        collapsed_path = _url_collapse_path(self.path)
+        dir_sep = collapsed_path.find('/', 1)
+        while dir_sep > 0 and not collapsed_path[:dir_sep] in self.cgi_directories:
+            dir_sep = collapsed_path.find('/', dir_sep+1)
+        if dir_sep > 0:
+            head, tail = collapsed_path[:dir_sep], collapsed_path[dir_sep+1:]
+            self.cgi_info = head, tail
+            return True
+        return False
+
+
+    cgi_directories = ['/cgi-bin', '/htbin']
+
+    def is_executable(self, path):
+        """Test whether argument path is an executable file."""
+        return executable(path)
+
+    def is_python(self, path):
+        """Test whether argument path is a Python script."""
+        head, tail = os.path.splitext(path)
+        return tail.lower() in (".py", ".pyw")
+
+    def run_cgi(self):
+        """Execute a CGI script."""
+        dir, rest = self.cgi_info
+        path = dir + '/' + rest
+        i = path.find('/', len(dir)+1)
+        while i >= 0:
+            nextdir = path[:i]
+            nextrest = path[i+1:]
+
+            scriptdir = self.translate_path(nextdir)
+            if os.path.isdir(scriptdir):
+                dir, rest = nextdir, nextrest
+                i = path.find('/', len(dir)+1)
+            else:
+                break
+
+        # find an explicit query string, if present.
+        rest, _, query = rest.partition('?')
+
+        # dissect the part after the directory name into a script name &
+        # a possible additional path, to be stored in PATH_INFO.
+        i = rest.find('/')
+        if i >= 0:
+            script, rest = rest[:i], rest[i:]
+        else:
+            script, rest = rest, ''
+
+        scriptname = dir + '/' + script
+        scriptfile = self.translate_path(scriptname)
+        if not os.path.exists(scriptfile):
+            self.send_error(
+                HTTPStatus.NOT_FOUND,
+                "No such CGI script (%r)" % scriptname)
+            return
+        if not os.path.isfile(scriptfile):
+            self.send_error(
+                HTTPStatus.FORBIDDEN,
+                "CGI script is not a plain file (%r)" % scriptname)
+            return
+        ispy = self.is_python(scriptname)
+        if self.have_fork or not ispy:
+            if not self.is_executable(scriptfile):
+                self.send_error(
+                    HTTPStatus.FORBIDDEN,
+                    "CGI script is not executable (%r)" % scriptname)
+                return
+
+        # Reference: http://hoohoo.ncsa.uiuc.edu/cgi/env.html
+        # XXX Much of the following could be prepared ahead of time!
+        env = copy.deepcopy(os.environ)
+        env['SERVER_SOFTWARE'] = self.version_string()
+        env['SERVER_NAME'] = self.server.server_name
+        env['GATEWAY_INTERFACE'] = 'CGI/1.1'
+        env['SERVER_PROTOCOL'] = self.protocol_version
+        env['SERVER_PORT'] = str(self.server.server_port)
+        env['REQUEST_METHOD'] = self.command
+        uqrest = urllib.parse.unquote(rest)
+        env['PATH_INFO'] = uqrest
+        env['PATH_TRANSLATED'] = self.translate_path(uqrest)
+        env['SCRIPT_NAME'] = scriptname
+        env['QUERY_STRING'] = query
+        env['REMOTE_ADDR'] = self.client_address[0]
+        authorization = self.headers.get("authorization")
+        if authorization:
+            authorization = authorization.split()
+            if len(authorization) == 2:
+                import base64, binascii
+                env['AUTH_TYPE'] = authorization[0]
+                if authorization[0].lower() == "basic":
+                    try:
+                        authorization = authorization[1].encode('ascii')
+                        authorization = base64.decodebytes(authorization).\
+                                        decode('ascii')
+                    except (binascii.Error, UnicodeError):
+                        pass
+                    else:
+                        authorization = authorization.split(':')
+                        if len(authorization) == 2:
+                            env['REMOTE_USER'] = authorization[0]
+        # XXX REMOTE_IDENT
+        if self.headers.get('content-type') is None:
+            env['CONTENT_TYPE'] = self.headers.get_content_type()
+        else:
+            env['CONTENT_TYPE'] = self.headers['content-type']
+        length = self.headers.get('content-length')
+        if length:
+            env['CONTENT_LENGTH'] = length
+        referer = self.headers.get('referer')
+        if referer:
+            env['HTTP_REFERER'] = referer
+        accept = self.headers.get_all('accept', ())
+        env['HTTP_ACCEPT'] = ','.join(accept)
+        ua = self.headers.get('user-agent')
+        if ua:
+            env['HTTP_USER_AGENT'] = ua
+        co = filter(None, self.headers.get_all('cookie', []))
+        cookie_str = ', '.join(co)
+        if cookie_str:
+            env['HTTP_COOKIE'] = cookie_str
+        # XXX Other HTTP_* headers
+        # Since we're setting the env in the parent, provide empty
+        # values to override previously set values
+        for k in ('QUERY_STRING', 'REMOTE_HOST', 'CONTENT_LENGTH',
+                  'HTTP_USER_AGENT', 'HTTP_COOKIE', 'HTTP_REFERER'):
+            env.setdefault(k, "")
+
+        self.send_response(HTTPStatus.OK, "Script output follows")
+        self.flush_headers()
+
+        decoded_query = query.replace('+', ' ')
+
+        if self.have_fork:
+            # Unix -- fork as we should
+            args = [script]
+            if '=' not in decoded_query:
+                args.append(decoded_query)
+            nobody = nobody_uid()
+            self.wfile.flush() # Always flush before forking
+            pid = os.fork()
+            if pid != 0:
+                # Parent
+                pid, sts = os.waitpid(pid, 0)
+                # throw away additional data [see bug #427345]
+                while select.select([self.rfile], [], [], 0)[0]:
+                    if not self.rfile.read(1):
+                        break
+                exitcode = os.waitstatus_to_exitcode(sts)
+                if exitcode:
+                    self.log_error(f"CGI script exit code {exitcode}")
+                return
+            # Child
+            try:
+                try:
+                    os.setuid(nobody)
+                except OSError:
+                    pass
+                os.dup2(self.rfile.fileno(), 0)
+                os.dup2(self.wfile.fileno(), 1)
+                os.execve(scriptfile, args, env)
+            except:
+                self.server.handle_error(self.request, self.client_address)
+                os._exit(127)
+
+        else:
+            # Non-Unix -- use subprocess
+            import subprocess
+            cmdline = [scriptfile]
+            if self.is_python(scriptfile):
+                interp = sys.executable
+                if interp.lower().endswith("w.exe"):
+                    # On Windows, use python.exe, not pythonw.exe
+                    interp = interp[:-5] + interp[-4:]
+                cmdline = [interp, '-u'] + cmdline
+            if '=' not in query:
+                cmdline.append(query)
+            self.log_message("command: %s", subprocess.list2cmdline(cmdline))
+            try:
+                nbytes = int(length)
+            except (TypeError, ValueError):
+                nbytes = 0
+            p = subprocess.Popen(cmdline,
+                                 stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE,
+                                 env = env
+                                 )
+            if self.command.lower() == "post" and nbytes > 0:
+                data = self.rfile.read(nbytes)
+            else:
+                data = None
+            # throw away additional data [see bug #427345]
+            while select.select([self.rfile._sock], [], [], 0)[0]:
+                if not self.rfile._sock.recv(1):
+                    break
+            stdout, stderr = p.communicate(data)
+            self.wfile.write(stdout)
+            if stderr:
+                self.log_error('%s', stderr)
+            p.stderr.close()
+            p.stdout.close()
+            status = p.returncode
+            if status:
+                self.log_error("CGI script exit status %#x", status)
+            else:
+                self.log_message("CGI script exited OK")
+
+
+def _get_best_family(*address):
+    infos = socket.getaddrinfo(
+        *address,
+        type=socket.SOCK_STREAM,
+        flags=socket.AI_PASSIVE,
+    )
+    family, type, proto, canonname, sockaddr = next(iter(infos))
+    return family, sockaddr
+
+
+def test(HandlerClass=BaseHTTPRequestHandler,
+         ServerClass=ThreadingHTTPServer,
+         protocol="HTTP/1.0", port=8000, bind=None):
+    """Test the HTTP request handler class.
+
+    This runs an HTTP server on port 8000 (or the port argument).
+
+    """
+    ServerClass.address_family, addr = _get_best_family(bind, port)
+    HandlerClass.protocol_version = protocol
+    with ServerClass(addr, HandlerClass) as httpd:
+        host, port = httpd.socket.getsockname()[:2]
+        url_host = f'[{host}]' if ':' in host else host
+        print(
+            f"Serving HTTP on {host} port {port} "
+            f"(http://{url_host}:{port}/) ..."
+        )
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nKeyboard interrupt received, exiting.")
+            sys.exit(0)
 
 if __name__ == '__main__':
-    init_db()
-    _p('=' * 52)
-    _p('[SERVER] 차원 균열의 만물상 - 온라인 서버')
-    _p(f'   바인딩 : {HOST}:{PORT}')
-    _p(f'   DB     : {DB_PATH}')
-    _p(f'   속도제한: IP당 10초 {RATE_LIMIT}회')
-    try:
-        import socket as _sk
-        s = _sk.socket(_sk.AF_INET, _sk.SOCK_DGRAM)
-        s.connect(('8.8.8.8', 80))
-        _p(f'   내부 IP : http://{s.getsockname()[0]}:{PORT}')
-        s.close()
-    except Exception:
-        pass
-    _p('   같은 PC : http://127.0.0.1:%d' % PORT)
-    _p('=' * 52)
-    _p('종료하려면 Ctrl+C')
-    try:
-        ThreadedHTTP((HOST, PORT), Handler).serve_forever()
-    except KeyboardInterrupt:
-        _p('\n서버를 종료합니다.')
+    import argparse
+    import contextlib
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cgi', action='store_true',
+                        help='run as CGI server')
+    parser.add_argument('-b', '--bind', metavar='ADDRESS',
+                        help='bind to this address '
+                             '(default: all interfaces)')
+    parser.add_argument('-d', '--directory', default=os.getcwd(),
+                        help='serve this directory '
+                             '(default: current directory)')
+    parser.add_argument('-p', '--protocol', metavar='VERSION',
+                        default='HTTP/1.0',
+                        help='conform to this HTTP version '
+                             '(default: %(default)s)')
+    parser.add_argument('port', default=8000, type=int, nargs='?',
+                        help='bind to this port '
+                             '(default: %(default)s)')
+    args = parser.parse_args()
+    if args.cgi:
+        handler_class = CGIHTTPRequestHandler
+    else:
+        handler_class = SimpleHTTPRequestHandler
+
+    # ensure dual-stack is not disabled; ref #38907
+    class DualStackServer(ThreadingHTTPServer):
+
+        def server_bind(self):
+            # suppress exception when protocol is IPv4
+            with contextlib.suppress(Exception):
+                self.socket.setsockopt(
+                    socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            return super().server_bind()
+
+        def finish_request(self, request, client_address):
+            self.RequestHandlerClass(request, client_address, self,
+                                     directory=args.directory)
+
+    test(
+        HandlerClass=handler_class,
+        ServerClass=DualStackServer,
+        port=args.port,
+        bind=args.bind,
+        protocol=args.protocol,
+    )
